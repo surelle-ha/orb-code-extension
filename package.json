@@ -1,67 +1,67 @@
 {
-  "name": "orb-code-extension",
-  "displayName": "orb-code-extension",
-  "description": "orb-code-extension",
-  "version": "0.0.1",
-  "engines": {
-    "vscode": "^1.110.0"
-  },
-  "categories": [
-    "Other"
-  ],
+  "name": "orb-devkit",
+  "displayName": "Orb DevKit",
+  "description": "Desktop daemon for Orb DevKit mobile app — ENV sync, vault backup, AI blocklist",
+  "version": "1.0.0",
+  "publisher": "orb-devkit",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
-  "activationEvents": [
-    "onStartupFinished"
-  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "orb-sidebar-container",
-          "title": "Orb",
-          "icon": "media/orb.svg"
+          "id": "orb-container",
+          "title": "Orb DevKit",
+          "icon": "media/orb-icon.svg"
         }
       ]
     },
     "views": {
-      "orb-sidebar-container": [
-        {
-          "id": "orbSidebar",
-          "name": "Orb DevKit"
-        }
+      "orb-container": [
+        { "id": "orb.main", "name": "Dashboard", "type": "webview" }
       ]
     },
     "commands": [
-      {
-        "command": "orb-code-extension.helloWorld",
-        "title": "Hello World"
+      { "command": "orb.startDaemon",   "title": "Orb: Start Daemon"         },
+      { "command": "orb.stopDaemon",    "title": "Orb: Stop Daemon"          },
+      { "command": "orb.showPairing",   "title": "Orb: Show Pairing QR"      },
+      { "command": "orb.openDashboard", "title": "Orb: Open Dashboard"       },
+      { "command": "orb.resetAll",      "title": "Orb: Reset All Data"       }
+    ],
+    "configuration": {
+      "title": "Orb DevKit",
+      "properties": {
+        "orb.port": {
+          "type": "number",
+          "default": 3131,
+          "description": "WebSocket port for the Orb daemon"
+        },
+        "orb.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-start daemon when VS Code opens"
+        }
       }
-    ]
+    }
   },
   "scripts": {
-    "vscode:prepublish": "pnpm run package",
-    "compile": "webpack",
-    "watch": "webpack --watch",
-    "package": "webpack --mode production --devtool hidden-source-map",
-    "compile-tests": "tsc -p . --outDir out",
-    "watch-tests": "tsc -p . -w --outDir out",
-    "pretest": "pnpm run compile-tests && pnpm run compile && pnpm run lint",
-    "lint": "eslint src",
-    "test": "vscode-test"
+    "compile": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --platform=node --external:vscode --sourcemap",
+    "watch": "npm run compile -- --watch",
+    "package": "npm run compile -- --minify",
+    "vscode:prepublish": "npm run package"
   },
   "devDependencies": {
-    "@types/mocha": "^10.0.10",
-    "@types/node": "22.x",
-    "@types/vscode": "^1.110.0",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2",
-    "ajv": "^8.18.0",
-    "eslint": "^9.39.3",
-    "ts-loader": "^9.5.4",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.56.1",
-    "uri-js": "^4.4.1",
-    "webpack": "^5.105.3",
-    "webpack-cli": "^6.0.1"
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "qrcode": "^1.5.3",
+    "uuid": "^9.0.0"
   }
 }
