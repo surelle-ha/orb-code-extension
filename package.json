@@ -4,9 +4,15 @@
   "description": "Desktop daemon for Orb DevKit mobile app — ENV sync, vault backup, AI blocklist",
   "version": "1.0.0",
   "publisher": "orb-devkit",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -20,15 +26,34 @@
     },
     "views": {
       "orb-container": [
-        { "id": "orb.main", "name": "Dashboard", "type": "webview" }
+        {
+          "id": "orb.main",
+          "name": "Dashboard",
+          "type": "webview"
+        }
       ]
     },
     "commands": [
-      { "command": "orb.startDaemon",   "title": "Orb: Start Daemon"         },
-      { "command": "orb.stopDaemon",    "title": "Orb: Stop Daemon"          },
-      { "command": "orb.showPairing",   "title": "Orb: Show Pairing QR"      },
-      { "command": "orb.openDashboard", "title": "Orb: Open Dashboard"       },
-      { "command": "orb.resetAll",      "title": "Orb: Reset All Data"       }
+      {
+        "command": "orb.startDaemon",
+        "title": "Orb: Start Daemon"
+      },
+      {
+        "command": "orb.stopDaemon",
+        "title": "Orb: Stop Daemon"
+      },
+      {
+        "command": "orb.showPairing",
+        "title": "Orb: Show Pairing QR"
+      },
+      {
+        "command": "orb.openDashboard",
+        "title": "Orb: Open Dashboard"
+      },
+      {
+        "command": "orb.resetAll",
+        "title": "Orb: Reset All Data"
+      }
     ],
     "configuration": {
       "title": "Orb DevKit",
@@ -56,12 +81,13 @@
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
     "@types/ws": "^8.5.10",
+    "@vscode/vsce": "^3.7.1",
     "esbuild": "^0.20.0",
     "typescript": "^5.3.0"
   },
   "dependencies": {
-    "ws": "^8.16.0",
     "qrcode": "^1.5.3",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "ws": "^8.16.0"
   }
 }

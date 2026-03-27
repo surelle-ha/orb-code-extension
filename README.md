@@ -1,71 +1,80 @@
-# orb-code-extension README
+# Orb DevKit — VS Code Extension
 
-This is the README for your extension "orb-code-extension". After writing up a brief description, we recommend including the following sections.
+A TypeScript-native VS Code extension that replaces the Rust daemon. Runs a WebSocket server directly inside VS Code, providing the same pairing protocol for the Orb mobile app.
 
 ## Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+- **WebSocket daemon** on port 3131 (configurable), starts automatically with VS Code
+- **QR code pairing** with 5-minute token expiry — pairs with the Orb mobile app
+- **ENV sync** — receives `.env` vars from the mobile app and writes them as `~/.orb-devkit/envs/<project>/<env>.env`
+- **Vault backup** — receives encrypted vault entries
+- **Blocklist sync** — writes an `/etc/hosts`-style file to block AI platforms during focus sessions
+- **Live dashboard** sidebar with activity log, paired devices, and stats
 
-For example if there is an image subfolder under your extension project workspace:
+## Setup
 
-\!\[feature X\]\(images/feature-x.png\)
+### Install dependencies
+\`\`\`bash
+npm install
+npm run compile
+\`\`\`
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+### Development
+\`\`\`bash
+npm run watch
+# Then press F5 in VS Code to launch Extension Development Host
+\`\`\`
 
-## Requirements
+### Packaging
+\`\`\`bash
+npm run package
+# Creates dist/extension.js
+\`\`\`
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+## Protocol
 
-## Extension Settings
+The extension speaks the same JSON-over-WebSocket protocol as the original Rust daemon:
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+\`\`\`
+ws://0.0.0.0:3131
+\`\`\`
 
-For example:
+All messages are plain JSON (no binary framing needed — the mobile app sends text frames when connecting to this endpoint):
 
-This extension contributes the following settings:
+**App → Daemon:**
+- `{ type: "Pair", payload: { token, device_name, device_os } }`
+- `{ type: "Ping", payload: { seq } }`
+- `{ type: "SyncEnv", payload: { project, environment, vars } }`
+- `{ type: "SyncBlocklist", payload: { platforms } }`
+- `{ type: "SyncVault", payload: { entries } }`
+- `{ type: "Reset", payload: {} }`
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+**Daemon → App:**
+- `{ type: "PairOk", payload: { daemon_name, daemon_version, fingerprint } }`
+- `{ type: "PairReject", payload: { reason } }`
+- `{ type: "Pong", payload: { seq, ts } }`
+- `{ type: "Ok", payload: { for_type } }`
 
-## Known Issues
+## Pairing
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+1. Open VS Code with this extension installed
+2. Click the ◉ Orb icon in the activity bar
+3. Click **Generate Pairing QR**
+4. Open the Orb mobile app → Devices → Pair Desktop
+5. Scan the QR code
+6. Both devices must be on the same WiFi network
 
-## Release Notes
+## Configuration
 
-Users appreciate release notes as you update your extension.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `orb.port` | `3131` | WebSocket port |
+| `orb.autoStart` | `true` | Start daemon when VS Code opens |
 
-### 1.0.0
+## Data Storage
 
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
-
----
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+All data is stored in VS Code's global storage directory:
+- `orb-config.json` — pairing config & device list
+- `orb-store.json` — synced ENVs, blocklist, vault
+- `envs/<project>/<env>.env` — written `.env` files
+- `blocklist/blocked.hosts` — hosts-file blocklist
