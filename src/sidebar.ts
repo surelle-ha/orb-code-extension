@@ -1,9 +1,13 @@
 // src/sidebar.ts
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import * as qrcode from 'qrcode';
 import { OrbDaemon, DaemonEvent } from './daemon';
 import { OrbConfig } from './types';
-import { generatePairingToken, encodePairingQR, buildPairingPayload, getLocalIp, isTokenValid, tokenExpiresIn } from './pairing';
+import {
+  generatePairingToken, encodePairingQR, buildPairingPayload,
+  getLocalIp, isTokenValid, tokenExpiresIn,
+} from './pairing';
 import { saveConfig } from './store';
 
 export class OrbSidebarProvider implements vscode.WebviewViewProvider {
@@ -12,44 +16,45 @@ export class OrbSidebarProvider implements vscode.WebviewViewProvider {
   private _daemon: OrbDaemon;
   private _context: vscode.ExtensionContext;
   private _cfg: OrbConfig;
-  private _logs: Array<{ ts: string; level: string; msg: string }> = [];
-  private _qrDataUrl: string | null = null;
   private _disposeEventListener?: () => void;
   private _tokenRefreshInterval?: NodeJS.Timeout;
 
   constructor(context: vscode.ExtensionContext, daemon: OrbDaemon, cfg: OrbConfig) {
     this._context = context;
-    this._daemon = daemon;
-    this._cfg = cfg;
+    this._daemon  = daemon;
+    this._cfg     = cfg;
   }
 
   updateState(cfg: OrbConfig): void {
     this._cfg = cfg;
-    this._pushStats();
+    this._pushAll();
   }
 
-  private _log(level: 'info' | 'warn' | 'error', msg: string): void {
-    const entry = { ts: new Date().toISOString().slice(11, 23), level, msg };
-    this._logs.unshift(entry);
-    if (this._logs.length > 100) this._logs.length = 100;
-    this._view?.webview.postMessage({ type: 'log', data: entry });
-  }
-
-  private _pushStats(): void {
+  private _pushAll(): void {
+    if (!this._view) { return; }
     const stats = this._daemon.getStats();
-    this._view?.webview.postMessage({ type: 'stats', data: stats });
-    this._view?.webview.postMessage({ type: 'devices', data: this._cfg.pairedDevices });
+    const data  = this._daemon.getData();
+    this._view.webview.postMessage({
+      type: 'state',
+      data: {
+        stats,
+        devices: this._cfg.pairedDevices,
+        envs:    data.envs,
+        vault:   data.vault,
+      },
+    });
   }
 
   private _startTokenRefresh(): void {
     this._stopTokenRefresh();
     this._tokenRefreshInterval = setInterval(() => {
+      if (!this._view) { return; }
       if (!isTokenValid(this._cfg)) {
-        this._view?.webview.postMessage({ type: 'token_expired' });
+        this._view.webview.postMessage({ type: 'token_expired' });
         this._stopTokenRefresh();
       } else {
         const remaining = Math.ceil(tokenExpiresIn(this._cfg) / 1000);
-        this._view?.webview.postMessage({ type: 'token_tick', data: { remaining } });
+        this._view.webview.postMessage({ type: 'token_tick', data: { remaining } });
       }
     }, 1000);
   }
@@ -63,609 +68,666 @@ export class OrbSidebarProvider implements vscode.WebviewViewProvider {
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this._view = webviewView;
-    webviewView.webview.options = { enableScripts: true };
-    webviewView.webview.html = this._buildHtml();
 
-    // Listen to daemon events
+    const nonce = crypto.randomBytes(16).toString('hex');
+
+    webviewView.webview.options = { enableScripts: true };
+    webviewView.webview.html    = this._buildHtml(nonce);
+
+    // ── Daemon events → webview ──────────────────────────────
     this._disposeEventListener?.();
     this._disposeEventListener = this._daemon.onEvent((evt: DaemonEvent) => {
       switch (evt.type) {
         case 'started':
-          this._log('info', `Daemon started on port ${(evt.data as any)?.port}`);
-          this._pushStats();
-          break;
         case 'stopped':
-          this._log('info', 'Daemon stopped');
-          this._pushStats();
-          break;
         case 'client_connected':
-          this._log('info', `Client connected (total: ${(evt.data as any)?.clientCount})`);
-          this._pushStats();
-          break;
         case 'client_disconnected':
-          this._log('info', `Client disconnected (${(evt.data as any)?.deviceLabel})`);
-          this._pushStats();
+        case 'synced_env':
+        case 'synced_blocklist':
+        case 'synced_vault':
+        case 'reset':
+          this._pushAll();
           break;
         case 'paired':
-          this._log('info', `✓ Paired: ${(evt.data as any)?.device?.name}`);
           this._stopTokenRefresh();
-          this._qrDataUrl = null;
-          this._view?.webview.postMessage({ type: 'paired', data: (evt.data as any)?.device });
-          this._pushStats();
-          break;
-        case 'synced_env':
-          this._log('info', `ENV synced: ${(evt.data as any)?.project}/${(evt.data as any)?.environment} (${(evt.data as any)?.count} vars)`);
-          this._pushStats();
-          break;
-        case 'synced_blocklist':
-          this._log('info', `Blocklist synced (${(evt.data as any)?.active} active)`);
-          this._pushStats();
-          break;
-        case 'synced_vault':
-          this._log('info', `Vault synced (${(evt.data as any)?.count} entries)`);
-          this._pushStats();
-          break;
-        case 'reset':
-          this._log('warn', 'Daemon data reset by mobile client');
-          this._pushStats();
-          break;
-        case 'log':
-          this._log('info', (evt.data as any)?.msg ?? '');
+          this._pushAll();
+          if (this._view) {
+            this._view.webview.postMessage({ type: 'paired' });
+          }
           break;
       }
     });
 
-    // Handle messages from webview
-    webviewView.webview.onDidReceiveMessage(async (msg) => {
+    // ── Webview → extension ──────────────────────────────────
+    webviewView.webview.onDidReceiveMessage(async (msg: { type: string; data?: unknown }) => {
       switch (msg.type) {
+
         case 'ready':
-          this._pushStats();
-          this._view?.webview.postMessage({ type: 'devices', data: this._cfg.pairedDevices });
-          this._view?.webview.postMessage({ type: 'logs', data: this._logs });
+          this._pushAll();
           break;
 
         case 'start_daemon':
           try {
             await this._daemon.start();
           } catch (e) {
-            this._log('error', `Failed to start: ${e}`);
             vscode.window.showErrorMessage(`Orb: Failed to start daemon — ${e}`);
           }
+          this._pushAll();
           break;
 
         case 'stop_daemon':
           await this._daemon.stop();
+          this._pushAll();
           break;
 
         case 'generate_qr':
+          if (!this._daemon.isRunning) { return; }
           await this._generateQR();
           break;
 
-        case 'unpair_device': {
-          const id = msg.data?.id;
+        case 'disconnect_device': {
+          const id = (msg.data as { id: string }).id;
           this._cfg.pairedDevices = this._cfg.pairedDevices.filter(d => d.id !== id);
           saveConfig(this._context, this._cfg);
-          this._pushStats();
-          this._view?.webview.postMessage({ type: 'devices', data: this._cfg.pairedDevices });
-          this._log('info', `Device unpaired: ${msg.data?.name}`);
+          this._pushAll();
           break;
         }
 
         case 'reset_all':
           this._cfg.pairedDevices = [];
           saveConfig(this._context, this._cfg);
-          this._qrDataUrl = null;
           this._stopTokenRefresh();
-          this._pushStats();
-          this._view?.webview.postMessage({ type: 'devices', data: [] });
-          this._log('warn', 'All data reset');
+          this._pushAll();
           break;
       }
     });
 
-    // Push initial state after a tick
-    setTimeout(() => this._pushStats(), 100);
+    // Push initial state shortly after the webview is ready
+    setTimeout(() => this._pushAll(), 150);
   }
 
   private async _generateQR(): Promise<void> {
-    if (!this._daemon.isRunning) {
-      try { await this._daemon.start(); } catch (e) {
-        this._log('error', `Cannot generate QR — daemon failed to start: ${e}`);
-        return;
-      }
-    }
     const { token } = generatePairingToken(this._cfg);
     saveConfig(this._context, this._cfg);
-    const host = getLocalIp();
-    const port = this._daemon.currentPort;
-    const payload = buildPairingPayload(host, port, token, 'none');
-    const qrString = encodePairingQR(payload);
+    const host      = getLocalIp();
+    const port      = this._daemon.currentPort;
+    const payload   = buildPairingPayload(host, port, token, 'none');
+    const qrString  = encodePairingQR(payload);
     try {
-      this._qrDataUrl = await qrcode.toDataURL(qrString, {
-        width: 280,
-        margin: 2,
-        color: { dark: '#ffffff', light: '#0d0d12' },
+      const dataUrl = await qrcode.toDataURL(qrString, {
+        width: 220, margin: 2,
+        color: { dark: '#e4e4ef', light: '#0d0d14' },
         errorCorrectionLevel: 'M',
       });
-      this._view?.webview.postMessage({
-        type: 'qr',
-        data: { dataUrl: this._qrDataUrl, host, port, token: token.slice(0, 8) + '...' + token.slice(-8) },
-      });
+      if (this._view) {
+        this._view.webview.postMessage({
+          type: 'qr',
+          data: { dataUrl, host, port, token: token.slice(0, 8) + '…' + token.slice(-8) },
+        });
+      }
       this._startTokenRefresh();
-      this._log('info', `Pairing QR generated — ws://${host}:${port}`);
     } catch (e) {
-      this._log('error', `QR generation failed: ${e}`);
+      vscode.window.showErrorMessage(`Orb: QR generation failed — ${e}`);
     }
   }
 
-  private _buildHtml(): string {
-    return `<!DOCTYPE html>
+  private _buildHtml(nonce: string): string {
+    return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'none';
+           style-src  'unsafe-inline' https://fonts.googleapis.com;
+           font-src   https://fonts.gstatic.com;
+           img-src    data: https:;
+           script-src 'nonce-${nonce}';">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Orb DevKit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');
-  
-  :root {
-    --bg:         #0a0a0f;
-    --bg2:        #111118;
-    --bg3:        #16161f;
-    --border:     rgba(255,255,255,0.07);
-    --border2:    rgba(255,255,255,0.12);
-    --accent:     #7c6dff;
-    --accent2:    #a78bfa;
-    --emerald:    #34d399;
-    --rose:       #f87171;
-    --amber:      #fbbf24;
-    --text:       #e4e4ef;
-    --text2:      #71717a;
-    --text3:      #3f3f46;
-    --radius:     10px;
-    --mono:       'JetBrains Mono', monospace;
-    --display:    'Syne', sans-serif;
-  }
+:root {
+  --bg:      #0a0a0f;
+  --bg2:     #111118;
+  --bg3:     #16161f;
+  --bdr:     rgba(255,255,255,0.07);
+  --bdr2:    rgba(255,255,255,0.12);
+  --accent:  #7c6dff;
+  --accent2: #a78bfa;
+  --emerald: #34d399;
+  --rose:    #f87171;
+  --amber:   #fbbf24;
+  --sky:     #60a5fa;
+  --text:    #e4e4ef;
+  --text2:   #71717a;
+  --text3:   #3f3f46;
+  --r:       9px;
+  --mono:    'JetBrains Mono', monospace;
+  --display: 'Syne', sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--mono); font-size: 11px; }
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-thumb { background: var(--text3); border-radius: 2px; }
 
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--mono); font-size: 11px; overflow-x: hidden; }
+.panel { padding: 11px; display: flex; flex-direction: column; gap: 9px; min-height: 100vh; }
 
-  /* Scrollbar */
-  ::-webkit-scrollbar { width: 3px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--text3); border-radius: 2px; }
+/* Header */
+.hdr { display: flex; align-items: center; justify-content: space-between; padding-bottom: 9px; border-bottom: 1px solid var(--bdr); }
+.logo { display: flex; align-items: center; gap: 7px; }
+.orb-mark { width: 26px; height: 26px; border-radius: 50%; background: radial-gradient(circle at 38% 32%, #1a1a2e 0%, #09090b 60%, #000 100%); border: 1px solid var(--accent); box-shadow: 0 0 10px color-mix(in srgb,var(--accent) 33%,transparent); animation: orbp 3s ease-in-out infinite; flex-shrink: 0; }
+@keyframes orbp { 0%,100% { box-shadow: 0 0 8px color-mix(in srgb,var(--accent) 27%,transparent); } 50% { box-shadow: 0 0 18px color-mix(in srgb,var(--accent) 53%,transparent); } }
+.logo-name { font-family: var(--display); font-size: 13px; font-weight: 800; letter-spacing: .05em; }
+.logo-name span { color: var(--accent); }
+.vtag { font-size: 8px; color: var(--text3); background: var(--bg3); border: 1px solid var(--bdr); padding: 2px 6px; border-radius: 4px; font-weight: 600; letter-spacing: .08em; }
 
-  .panel { padding: 12px; display: flex; flex-direction: column; gap: 10px; min-height: 100vh; }
+/* Status pill */
+.status-row { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: var(--r); background: var(--bg2); border: 1px solid var(--bdr); }
+.sdot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--rose); }
+.sdot.on { background: var(--emerald); animation: pdot 2s ease-in-out infinite; }
+@keyframes pdot { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+.slbl { font-weight: 700; font-size: 10px; flex: 1; color: var(--rose); }
+.slbl.on { color: var(--emerald); }
+.smeta { font-size: 9px; color: var(--text3); }
+.tbtn { padding: 4px 9px; border-radius: 5px; border: none; cursor: pointer; font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; transition: opacity .12s; background: #2d2d3a; color: var(--text2); border: 1px solid var(--bdr2); }
+.tbtn:hover { opacity: .8; }
+.tbtn.start { background: rgba(52,211,153,.12); color: var(--emerald); border-color: rgba(52,211,153,.3); }
+.tbtn.stop  { background: rgba(248,113,113,.1); color: var(--rose);    border-color: rgba(248,113,113,.25); }
 
-  /* ── Header ── */
-  .header { display: flex; align-items: center; justify-content: space-between; padding: 4px 0 8px; border-bottom: 1px solid var(--border); }
-  .logo { display: flex; align-items: center; gap: 8px; }
-  .orb-mark { width: 28px; height: 28px; border-radius: 50%; background: radial-gradient(circle at 38% 32%, #1a1a2e 0%, #09090b 60%, #000 100%); border: 1px solid var(--accent); box-shadow: 0 0 10px var(--accent)55, inset 0 0 8px rgba(0,0,0,0.8); position: relative; flex-shrink: 0; animation: orb-pulse 3s ease-in-out infinite; }
-  @keyframes orb-pulse { 0%,100%{box-shadow:0 0 8px var(--accent)44} 50%{box-shadow:0 0 16px var(--accent)88,0 0 30px var(--accent)22} }
-  .logo-text { font-family: var(--display); font-size: 13px; font-weight: 800; color: var(--text); letter-spacing: 0.05em; }
-  .logo-text span { color: var(--accent); }
-  .version-tag { font-size: 9px; color: var(--text3); background: var(--bg3); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; font-weight: 600; letter-spacing: 0.08em; }
+/* Section head */
+.sh { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+.stitle { font-size: 8px; font-weight: 700; color: var(--text3); text-transform: uppercase; letter-spacing: .12em; }
 
-  /* ── Status bar ── */
-  .status-bar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); }
-  .status-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-  .status-dot.online { background: var(--emerald); box-shadow: 0 0 6px var(--emerald)88; animation: pulse-dot 2s ease-in-out infinite; }
-  .status-dot.offline { background: var(--rose); }
-  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.4} }
-  .status-label { font-weight: 700; font-size: 10px; flex: 1; }
-  .status-label.online { color: var(--emerald); }
-  .status-label.offline { color: var(--rose); }
-  .status-meta { font-size: 9px; color: var(--text3); }
-  .status-btn { padding: 3px 8px; border-radius: 5px; border: none; cursor: pointer; font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; transition: all 0.15s; }
-  .btn-start { background: var(--emerald)22; color: var(--emerald); border: 1px solid var(--emerald)44; }
-  .btn-start:hover { background: var(--emerald)33; }
-  .btn-stop { background: var(--rose)15; color: var(--rose); border: 1px solid var(--rose)33; }
-  .btn-stop:hover { background: var(--rose)25; }
+/* Device card */
+.device-card { background: var(--bg2); border: 1px solid rgba(124,109,255,.2); border-radius: var(--r); padding: 9px 11px; display: flex; align-items: center; gap: 8px; }
+.dorb { width: 30px; height: 30px; border-radius: 50%; background: radial-gradient(circle at 38% 32%, #1a1a2e 0%, #000 100%); border: 1px solid rgba(124,109,255,.4); flex-shrink: 0; }
+.dinfo { flex: 1; min-width: 0; }
+.dname { font-weight: 700; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dmeta { font-size: 9px; color: var(--text3); margin-top: 2px; }
+.dbadge { font-size: 8px; font-weight: 700; padding: 2px 6px; border-radius: 4px; background: rgba(52,211,153,.1); color: var(--emerald); border: 1px solid rgba(52,211,153,.2); white-space: nowrap; }
+.disc-btn { padding: 3px 8px; border-radius: 5px; background: rgba(248,113,113,.08); color: var(--rose); border: 1px solid rgba(248,113,113,.2); cursor: pointer; font-family: var(--mono); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; flex-shrink: 0; }
+.disc-btn:hover { background: rgba(248,113,113,.18); }
 
-  /* ── Stats grid ── */
-  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-  .stat-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; }
-  .stat-label { font-size: 8px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; margin-bottom: 4px; }
-  .stat-value { font-size: 20px; font-weight: 800; line-height: 1; }
-  .stat-sub { font-size: 8px; color: var(--text3); margin-top: 3px; }
-  .c-accent { color: var(--accent2); }
-  .c-emerald { color: var(--emerald); }
-  .c-amber { color: var(--amber); }
-  .c-rose { color: var(--rose); }
+/* Pairing card */
+.pair-card { background: var(--bg2); border: 1px solid var(--bdr); border-radius: var(--r); overflow: hidden; }
+.pair-hd { padding: 8px 10px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--bdr); }
+.pair-icon { width: 26px; height: 26px; border-radius: 6px; display: flex; align-items: center; justify-content: center; background: rgba(124,109,255,.1); border: 1px solid rgba(124,109,255,.25); font-size: 13px; flex-shrink: 0; }
+.pair-title { font-weight: 700; font-size: 10px; }
+.pair-sub { font-size: 8px; color: var(--text3); margin-top: 1px; }
+.pair-body { padding: 10px; display: flex; flex-direction: column; gap: 8px; }
 
-  /* ── Section ── */
-  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
-  .section-title { font-size: 9px; font-weight: 700; color: var(--text3); text-transform: uppercase; letter-spacing: 0.12em; }
-  .section-action { font-size: 9px; font-weight: 700; color: var(--accent); background: var(--accent)15; border: 1px solid var(--accent)30; border-radius: 5px; padding: 2px 7px; cursor: pointer; transition: all 0.15s; font-family: var(--mono); }
-  .section-action:hover { background: var(--accent)25; }
+/* Steps */
+.steps { display: flex; flex-direction: column; gap: 5px; }
+.step { display: flex; gap: 7px; align-items: flex-start; }
+.snum { width: 16px; height: 16px; border-radius: 50%; background: rgba(124,109,255,.12); border: 1px solid rgba(124,109,255,.25); color: var(--accent); font-size: 8px; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
+.stext { font-size: 9px; color: var(--text2); line-height: 1.4; }
+.stext b { color: var(--accent2); }
 
-  /* ── Pairing ── */
-  .pair-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-  .pair-header { padding: 8px 10px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); }
-  .pair-icon { width: 28px; height: 28px; border-radius: 7px; display: flex; align-items: center; justify-content: center; background: var(--accent)15; border: 1px solid var(--accent)30; font-size: 14px; }
-  .pair-title { font-weight: 700; font-size: 11px; color: var(--text); }
-  .pair-sub { font-size: 9px; color: var(--text3); margin-top: 1px; }
-  .pair-body { padding: 10px; }
-  .qr-wrap { display: flex; flex-direction: column; align-items: center; gap: 10px; }
-  .qr-img { border-radius: 8px; border: 1px solid var(--border); }
-  .qr-meta { width: 100%; display: flex; flex-direction: column; gap: 5px; }
-  .qr-row { display: flex; align-items: center; justify-content: space-between; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; }
-  .qr-key { font-size: 8px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.1em; }
-  .qr-val { font-size: 9px; font-weight: 600; color: var(--text); font-family: var(--mono); }
-  .qr-val.accent { color: var(--accent2); }
-  .timer-bar { width: 100%; height: 3px; border-radius: 2px; background: var(--border); overflow: hidden; }
-  .timer-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width 1s linear; }
-  .timer-label { font-size: 8px; color: var(--text3); text-align: center; }
-  .expired-msg { text-align: center; padding: 12px 0 4px; color: var(--rose); font-size: 10px; font-weight: 600; }
-  .gen-qr-btn { width: 100%; padding: 9px; background: var(--accent); color: #fff; border: none; border-radius: 7px; cursor: pointer; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; transition: all 0.15s; text-transform: uppercase; }
-  .gen-qr-btn:hover { background: var(--accent2); }
+/* QR */
+.qr-wrap { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.qr-img { border-radius: 7px; border: 1px solid var(--bdr); display: block; }
+.qr-meta { width: 100%; display: flex; flex-direction: column; gap: 4px; }
+.qrow { display: flex; align-items: center; justify-content: space-between; background: var(--bg3); border: 1px solid var(--bdr); border-radius: 5px; padding: 4px 8px; }
+.qkey { font-size: 8px; color: var(--text3); text-transform: uppercase; letter-spacing: .09em; }
+.qval { font-size: 9px; font-weight: 600; color: var(--text); font-family: var(--mono); }
+.qval.a { color: var(--accent2); }
+.timer-bar { width: 100%; height: 3px; border-radius: 2px; background: var(--bdr); overflow: hidden; }
+.timer-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width 1s linear; }
+.timer-lbl { font-size: 8px; color: var(--text3); text-align: center; margin-top: 2px; }
+.expired-msg { text-align: center; color: var(--rose); font-size: 9px; font-weight: 600; padding: 6px 0; }
+.qr-btn { width: 100%; padding: 8px; background: var(--accent); color: #fff; border: none; border-radius: 7px; cursor: pointer; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.qr-btn:hover:not(:disabled) { background: var(--accent2); }
+.qr-btn:disabled { opacity: .35; cursor: not-allowed; }
 
-  /* ── Steps ── */
-  .steps { display: flex; flex-direction: column; gap: 6px; padding-top: 4px; }
-  .step { display: flex; gap: 8px; align-items: flex-start; }
-  .step-num { width: 18px; height: 18px; border-radius: 50%; background: var(--accent)18; border: 1px solid var(--accent)30; color: var(--accent); font-size: 9px; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
-  .step-text { font-size: 10px; color: var(--text2); line-height: 1.4; }
-  .step-text b { color: var(--accent2); }
+/* Stats */
+.stats2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.scard { background: var(--bg2); border: 1px solid var(--bdr); border-radius: var(--r); padding: 8px 10px; }
+.sc-label { font-size: 8px; color: var(--text3); text-transform: uppercase; letter-spacing: .1em; font-weight: 700; margin-bottom: 3px; }
+.sc-val { font-size: 19px; font-weight: 800; line-height: 1; }
+.sc-sub { font-size: 8px; color: var(--text3); margin-top: 2px; }
+.cam { color: var(--amber); }
+.cr  { color: var(--rose); }
 
-  /* ── Devices ── */
-  .device-list { display: flex; flex-direction: column; gap: 6px; }
-  .device-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; display: flex; align-items: center; gap: 8px; }
-  .device-orb { width: 32px; height: 32px; border-radius: 50%; background: radial-gradient(circle at 38% 32%, #1a1a2e 0%, #000 100%); border: 1px solid var(--accent)66; box-shadow: 0 0 8px var(--accent)33; flex-shrink: 0; }
-  .device-info { flex: 1; min-width: 0; }
-  .device-name { font-weight: 700; font-size: 10px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .device-meta { font-size: 9px; color: var(--text3); margin-top: 2px; }
-  .device-badge { font-size: 8px; font-weight: 700; padding: 2px 6px; border-radius: 4px; background: var(--emerald)15; color: var(--emerald); border: 1px solid var(--emerald)25; white-space: nowrap; }
-  .device-rm { width: 24px; height: 24px; border-radius: 5px; background: var(--rose)10; border: 1px solid var(--rose)20; color: var(--rose); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 12px; transition: all 0.15s; flex-shrink: 0; }
-  .device-rm:hover { background: var(--rose)25; }
-  .no-devices { text-align: center; padding: 14px; color: var(--text3); font-size: 9px; border: 1px dashed var(--border2); border-radius: var(--radius); }
+/* ENV */
+.env-list { display: flex; flex-direction: column; gap: 5px; }
+.env-proj { background: var(--bg2); border: 1px solid var(--bdr); border-radius: var(--r); overflow: hidden; }
+.env-proj-hd { display: flex; align-items: center; gap: 7px; padding: 7px 9px; cursor: pointer; user-select: none; }
+.env-proj-hd:hover { background: rgba(255,255,255,.02); }
+.proj-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.proj-name { font-weight: 700; font-size: 10px; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.proj-env-tag { font-size: 7px; font-weight: 700; padding: 1px 5px; border-radius: 3px; flex-shrink: 0; }
+.proj-chev { font-size: 11px; color: var(--text3); transition: transform .18s; flex-shrink: 0; display: inline-block; }
+.proj-chev.open { transform: rotate(90deg); }
+.env-vars { border-top: 1px solid var(--bdr); }
+.var-row { display: flex; align-items: center; gap: 6px; padding: 5px 9px; border-bottom: 1px solid rgba(255,255,255,.03); }
+.var-row:last-child { border-bottom: none; }
+.var-key { font-size: 9px; font-weight: 600; color: var(--text); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.var-type { font-size: 7px; font-weight: 700; padding: 1px 4px; border-radius: 3px; background: var(--bg3); color: var(--text3); border: 1px solid var(--bdr); text-transform: uppercase; flex-shrink: 0; }
+.var-secret { font-size: 9px; color: var(--amber); flex-shrink: 0; }
 
-  /* ── Log ── */
-  .log-box { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); max-height: 130px; overflow-y: auto; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; }
-  .log-entry { display: flex; gap: 6px; font-size: 9px; line-height: 1.5; }
-  .log-ts { color: var(--text3); flex-shrink: 0; font-size: 8px; }
-  .log-msg { color: var(--text2); word-break: break-all; }
-  .log-entry.error .log-msg { color: var(--rose); }
-  .log-entry.warn .log-msg { color: var(--amber); }
-  .log-entry.info .log-msg { color: var(--text2); }
-  .log-empty { color: var(--text3); font-size: 9px; text-align: center; padding: 8px; }
+/* Vault */
+.vault-list { display: flex; flex-direction: column; gap: 4px; }
+.vault-entry { display: flex; align-items: center; gap: 8px; background: var(--bg2); border: 1px solid var(--bdr); border-radius: var(--r); padding: 7px 9px; }
+.vault-fav { width: 22px; height: 22px; border-radius: 5px; background: var(--bg3); border: 1px solid var(--bdr); display: flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; }
+.vault-info { flex: 1; min-width: 0; }
+.vault-svc  { font-weight: 700; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vault-usr  { font-size: 9px; color: var(--text3); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vault-cat  { font-size: 7px; font-weight: 700; padding: 1px 5px; border-radius: 3px; flex-shrink: 0; }
 
-  /* ── Footer ── */
-  .footer { display: flex; align-items: center; justify-content: space-between; padding-top: 6px; border-top: 1px solid var(--border); margin-top: 4px; }
-  .footer-left { font-size: 8px; color: var(--text3); }
-  .reset-btn { font-size: 8px; color: var(--rose)99; background: var(--rose)08; border: 1px solid var(--rose)15; padding: 2px 7px; border-radius: 4px; cursor: pointer; font-family: var(--mono); font-weight: 600; }
-  .reset-btn:hover { color: var(--rose); background: var(--rose)15; }
-
-  /* ── Uptime ── */
-  #uptime { font-feature-settings: 'tnum'; }
+/* Footer */
+.footer { display: flex; align-items: center; justify-content: space-between; padding-top: 6px; border-top: 1px solid var(--bdr); margin-top: 2px; }
+.f-left { font-size: 8px; color: var(--text3); }
+.rst-btn { font-size: 8px; color: var(--rose); opacity: .55; background: rgba(248,113,113,.06); border: 1px solid rgba(248,113,113,.15); padding: 2px 7px; border-radius: 4px; cursor: pointer; font-family: var(--mono); font-weight: 600; }
+.rst-btn:hover { opacity: 1; }
 </style>
 </head>
 <body>
 <div class="panel">
 
   <!-- Header -->
-  <div class="header">
+  <div class="hdr">
     <div class="logo">
       <div class="orb-mark"></div>
-      <div>
-        <div class="logo-text">Orb<span> DevKit</span></div>
-      </div>
+      <div class="logo-name">Orb<span> DevKit</span></div>
     </div>
-    <div class="version-tag">v1.0.0</div>
+    <div class="vtag">v1.0.0</div>
   </div>
 
-  <!-- Status bar -->
-  <div class="status-bar" id="status-bar">
-    <div class="status-dot offline" id="status-dot"></div>
-    <span class="status-label offline" id="status-label">daemon · offline</span>
-    <span class="status-meta" id="status-meta">—</span>
-    <button class="status-btn btn-start" id="toggle-btn" onclick="toggleDaemon()">Start</button>
+  <!-- Status row -->
+  <div class="status-row">
+    <div class="sdot" id="sdot"></div>
+    <span class="slbl" id="slbl">daemon · offline</span>
+    <span class="smeta" id="smeta">—</span>
+    <button class="tbtn start" id="toggle-btn">Start</button>
   </div>
 
-  <!-- Stats -->
-  <div class="stats-grid">
-    <div class="stat-card">
-      <div class="stat-label">Clients</div>
-      <div class="stat-value c-accent" id="stat-clients">0</div>
-      <div class="stat-sub">connected now</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Paired</div>
-      <div class="stat-value c-emerald" id="stat-paired">0</div>
-      <div class="stat-sub">devices</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">ENV vars</div>
-      <div class="stat-value c-amber" id="stat-vars">0</div>
-      <div class="stat-sub" id="stat-projects">0 projects</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Vault</div>
-      <div class="stat-value c-rose" id="stat-vault">0</div>
-      <div class="stat-sub">entries synced</div>
-    </div>
+  <!-- Connected device -->
+  <div id="device-section" style="display:none">
+    <div class="sh"><span class="stitle">Connected Device</span></div>
+    <div id="device-slot"></div>
   </div>
 
-  <!-- Pairing section -->
-  <div>
-    <div class="section-head">
-      <span class="section-title">Pairing</span>
-    </div>
+  <!-- Pairing card -->
+  <div id="pair-section">
+    <div class="sh"><span class="stitle">Pair Mobile App</span></div>
     <div class="pair-card">
-      <div class="pair-header">
+      <div class="pair-hd">
         <div class="pair-icon">📡</div>
         <div>
           <div class="pair-title">Connect Mobile App</div>
-          <div class="pair-sub">Scan QR from the Orb mobile app → Devices tab</div>
+          <div class="pair-sub">Open Orb app → Devices → Pair Desktop</div>
         </div>
       </div>
       <div class="pair-body">
-        <!-- QR display -->
-        <div id="qr-section" style="display:none;" class="qr-wrap">
+        <div id="qr-section" style="display:none" class="qr-wrap">
           <img id="qr-img" class="qr-img" width="220" height="220" alt="Pairing QR" />
           <div class="qr-meta">
-            <div class="qr-row">
-              <span class="qr-key">Address</span>
-              <span class="qr-val accent" id="qr-addr">—</span>
+            <div class="qrow">
+              <span class="qkey">Address</span>
+              <span class="qval a" id="qr-addr">—</span>
             </div>
-            <div class="qr-row">
-              <span class="qr-key">Token</span>
-              <span class="qr-val" id="qr-token">—</span>
+            <div class="qrow">
+              <span class="qkey">Token</span>
+              <span class="qval" id="qr-token">—</span>
             </div>
             <div>
               <div class="timer-bar"><div class="timer-fill" id="timer-fill" style="width:100%"></div></div>
-              <div class="timer-label" id="timer-label">Expires in 5:00</div>
+              <div class="timer-lbl" id="timer-lbl">Expires in 5:00</div>
             </div>
           </div>
         </div>
-
-        <!-- Expired / not yet generated -->
-        <div id="qr-expired" style="display:none;">
-          <div class="expired-msg">⚠ Token expired — generate a new QR code</div>
+        <div id="qr-expired" style="display:none">
+          <div class="expired-msg">⚠ Token expired — regenerate below</div>
         </div>
-
-        <!-- Default: steps + button -->
         <div id="qr-steps" class="steps">
-          <div class="step">
-            <div class="step-num">1</div>
-            <div class="step-text">Open the <b>Orb</b> mobile app and navigate to <b>Devices</b></div>
-          </div>
-          <div class="step">
-            <div class="step-num">2</div>
-            <div class="step-text">Tap <b>Pair Desktop</b> then click the button below</div>
-          </div>
-          <div class="step">
-            <div class="step-num">3</div>
-            <div class="step-text">Scan the QR — must be on the <b>same WiFi</b> network</div>
-          </div>
+          <div class="step"><div class="snum">1</div><div class="stext">Open the <b>Orb</b> app → <b>Devices</b> tab</div></div>
+          <div class="step"><div class="snum">2</div><div class="stext">Tap <b>Pair Desktop</b>, then Generate below</div></div>
+          <div class="step"><div class="snum">3</div><div class="stext">Scan QR — both on the <b>same WiFi</b></div></div>
         </div>
-
-        <button class="gen-qr-btn" style="margin-top:10px;" onclick="generateQR()">
-          ⬡ Generate Pairing QR
-        </button>
+        <button class="qr-btn" id="gen-btn" disabled>⬡ Generate Pairing QR</button>
       </div>
     </div>
   </div>
 
-  <!-- Paired devices -->
-  <div>
-    <div class="section-head">
-      <span class="section-title">Paired Devices</span>
+  <!-- Stats row -->
+  <div class="stats2" id="stats-row" style="display:none">
+    <div class="scard">
+      <div class="sc-label">ENV vars</div>
+      <div class="sc-val cam" id="stat-vars">0</div>
+      <div class="sc-sub" id="stat-projects">0 projects</div>
     </div>
-    <div class="device-list" id="device-list">
-      <div class="no-devices" id="no-devices">No devices paired yet</div>
+    <div class="scard">
+      <div class="sc-label">Vault</div>
+      <div class="sc-val cr" id="stat-vault">0</div>
+      <div class="sc-sub">entries synced</div>
     </div>
   </div>
 
-  <!-- Live log -->
-  <div>
-    <div class="section-head">
-      <span class="section-title">Activity Log</span>
-      <button class="section-action" onclick="clearLog()">Clear</button>
-    </div>
-    <div class="log-box" id="log-box">
-      <div class="log-empty">No activity yet…</div>
-    </div>
+  <!-- ENV section -->
+  <div id="env-section" style="display:none">
+    <div class="sh"><span class="stitle">ENV Variables</span></div>
+    <div class="env-list" id="env-list"></div>
+  </div>
+
+  <!-- Vault section -->
+  <div id="vault-section" style="display:none">
+    <div class="sh"><span class="stitle">Vault Entries</span></div>
+    <div class="vault-list" id="vault-list"></div>
   </div>
 
   <!-- Footer -->
   <div class="footer">
-    <span class="footer-left">Uptime: <span id="uptime">—</span></span>
-    <button class="reset-btn" onclick="resetAll()">Reset All</button>
+    <span class="f-left">Uptime: <span id="uptime">—</span></span>
+    <button class="rst-btn" id="reset-btn">Reset All</button>
   </div>
 
 </div>
 
-<script>
-const vscode = acquireVsCodeApi();
+<script nonce="${nonce}">
+(function() {
+  const vscode = acquireVsCodeApi();
 
-let daemonRunning = false;
-let uptimeStart = null;
-let uptimeTimer = null;
-let tokenMax = 300;
-let tokenRemaining = 300;
-let qrVisible = false;
+  // ── State ───────────────────────────────────────────────────
+  let daemonRunning   = false;
+  let hasPairedDevice = false;
+  let uptimeStart     = null;
+  let uptimeTimer     = null;
+  let tokenMax        = 300;
+  let tokenRemaining  = 300;
+  const openProjects  = new Set();
 
-// ── Uptime ──────────────────────────────────────────────────
-function startUptime(ms) {
-  uptimeStart = Date.now() - ms;
-  clearInterval(uptimeTimer);
-  uptimeTimer = setInterval(renderUptime, 1000);
-  renderUptime();
-}
-function stopUptime() {
-  clearInterval(uptimeTimer);
-  uptimeTimer = null;
-  uptimeStart = null;
-  document.getElementById('uptime').textContent = '—';
-}
-function renderUptime() {
-  if (!uptimeStart) return;
-  const s = Math.floor((Date.now() - uptimeStart) / 1000);
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
-  document.getElementById('uptime').textContent = h > 0
-    ? h + 'h ' + String(m).padStart(2,'0') + 'm'
-    : String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
-}
-
-// ── Stats update ────────────────────────────────────────────
-function updateStats(stats) {
-  daemonRunning = stats.running;
-
-  const dot   = document.getElementById('status-dot');
-  const label = document.getElementById('status-label');
-  const meta  = document.getElementById('status-meta');
-  const btn   = document.getElementById('toggle-btn');
-
-  if (stats.running) {
-    dot.className   = 'status-dot online';
-    label.className = 'status-label online';
-    label.textContent = 'daemon · online';
-    meta.textContent  = ':' + stats.port;
-    btn.className  = 'status-btn btn-stop';
-    btn.textContent = 'Stop';
-    startUptime(stats.uptime);
-  } else {
-    dot.className   = 'status-dot offline';
-    label.className = 'status-label offline';
-    label.textContent = 'daemon · offline';
-    meta.textContent  = '—';
-    btn.className  = 'status-btn btn-start';
-    btn.textContent = 'Start';
-    stopUptime();
-  }
-
-  document.getElementById('stat-clients').textContent = stats.connectedClients;
-  document.getElementById('stat-paired').textContent  = stats.pairedDevices;
-  document.getElementById('stat-vars').textContent    = stats.totalVars ?? '0';
-  document.getElementById('stat-projects').textContent = (stats.envProjects ?? 0) + ' projects';
-  document.getElementById('stat-vault').textContent   = stats.vaultEntries;
-}
-
-// ── Device list ─────────────────────────────────────────────
-function renderDevices(devices) {
-  const list = document.getElementById('device-list');
-  const noDevices = document.getElementById('no-devices');
-  if (!devices || !devices.length) {
-    noDevices.style.display = '';
-    const existing = list.querySelectorAll('.device-card');
-    existing.forEach(el => el.remove());
-    return;
-  }
-  noDevices.style.display = 'none';
-  list.querySelectorAll('.device-card').forEach(el => el.remove());
-  devices.forEach(d => {
-    const el = document.createElement('div');
-    el.className = 'device-card';
-    el.dataset.id = d.id;
-    el.innerHTML = \`
-      <div class="device-orb"></div>
-      <div class="device-info">
-        <div class="device-name">\${escHtml(d.name)}</div>
-        <div class="device-meta">Paired \${timeAgo(d.pairedAt)}</div>
-      </div>
-      <div class="device-badge">paired</div>
-      <div class="device-rm" onclick="unpairDevice('\${escHtml(d.id)}','\${escHtml(d.name)}')">×</div>
-    \`;
-    list.appendChild(el);
+  // ── Wire up buttons via addEventListener (no inline onclick) ─
+  document.getElementById('toggle-btn').addEventListener('click', function() {
+    vscode.postMessage({ type: daemonRunning ? 'stop_daemon' : 'start_daemon' });
   });
-}
 
-// ── Log ─────────────────────────────────────────────────────
-function addLog(entry) {
-  const box = document.getElementById('log-box');
-  const empty = box.querySelector('.log-empty');
-  if (empty) empty.remove();
-  const el = document.createElement('div');
-  el.className = 'log-entry ' + (entry.level || 'info');
-  el.innerHTML = \`<span class="log-ts">\${escHtml(entry.ts)}</span><span class="log-msg">\${escHtml(entry.msg)}</span>\`;
-  box.insertBefore(el, box.firstChild);
-  while (box.children.length > 60) box.removeChild(box.lastChild);
-}
-function clearLog() {
-  document.getElementById('log-box').innerHTML = '<div class="log-empty">No activity yet…</div>';
-}
+  document.getElementById('gen-btn').addEventListener('click', function() {
+    if (!daemonRunning || hasPairedDevice) { return; }
+    vscode.postMessage({ type: 'generate_qr' });
+  });
 
-// ── QR ──────────────────────────────────────────────────────
-function showQR(data) {
-  qrVisible = true;
-  document.getElementById('qr-steps').style.display = 'none';
-  document.getElementById('qr-expired').style.display = 'none';
-  document.getElementById('qr-section').style.display = '';
-  document.getElementById('qr-img').src = data.dataUrl;
-  document.getElementById('qr-addr').textContent = 'ws://' + data.host + ':' + data.port;
-  document.getElementById('qr-token').textContent = data.token;
-  tokenMax = 300;
-  tokenRemaining = 300;
-  updateTimer();
-}
-function updateTimer() {
-  const pct = Math.max(0, (tokenRemaining / tokenMax) * 100);
-  document.getElementById('timer-fill').style.width = pct + '%';
-  const m = Math.floor(tokenRemaining / 60);
-  const s = tokenRemaining % 60;
-  document.getElementById('timer-label').textContent = 'Expires in ' + m + ':' + String(s).padStart(2,'0');
-}
-function expireQR() {
-  qrVisible = false;
-  document.getElementById('qr-section').style.display = 'none';
-  document.getElementById('qr-steps').style.display = 'none';
-  document.getElementById('qr-expired').style.display = '';
-}
-function pairSuccess(device) {
-  qrVisible = false;
-  document.getElementById('qr-section').style.display = 'none';
-  document.getElementById('qr-expired').style.display = 'none';
-  document.getElementById('qr-steps').style.display = '';
-}
+  document.getElementById('reset-btn').addEventListener('click', function() {
+    if (confirm('Reset all Orb data? This will unpair all devices and clear synced data.')) {
+      vscode.postMessage({ type: 'reset_all' });
+    }
+  });
 
-// ── Actions ──────────────────────────────────────────────────
-function toggleDaemon() {
-  vscode.postMessage({ type: daemonRunning ? 'stop_daemon' : 'start_daemon' });
-}
-function generateQR() {
-  vscode.postMessage({ type: 'generate_qr' });
-}
-function unpairDevice(id, name) {
-  vscode.postMessage({ type: 'unpair_device', data: { id, name } });
-}
-function resetAll() {
-  if (confirm('Reset all Orb data? This will unpair all devices.')) {
-    vscode.postMessage({ type: 'reset_all' });
+  // Disconnect button is injected dynamically — use event delegation
+  document.getElementById('device-slot').addEventListener('click', function(e) {
+    const btn = e.target.closest('.disc-btn');
+    if (btn && btn.dataset.id) {
+      vscode.postMessage({ type: 'disconnect_device', data: { id: btn.dataset.id } });
+    }
+  });
+
+  // ENV project toggle — event delegation
+  document.getElementById('env-list').addEventListener('click', function(e) {
+    const hd = e.target.closest('.env-proj-hd');
+    if (!hd) { return; }
+    const key  = hd.dataset.projkey;
+    const body = document.getElementById(key);
+    const chev = hd.querySelector('.proj-chev');
+    if (!body) { return; }
+    const isOpen = body.style.display !== 'none';
+    body.style.display = isOpen ? 'none' : '';
+    chev.classList.toggle('open', !isOpen);
+    if (isOpen) { openProjects.delete(key); } else { openProjects.add(key); }
+  });
+
+  // ── Uptime ──────────────────────────────────────────────────
+  function startUptime(ms) {
+    uptimeStart = Date.now() - ms;
+    clearInterval(uptimeTimer);
+    uptimeTimer = setInterval(renderUptime, 1000);
+    renderUptime();
   }
-}
-
-// ── Helpers ──────────────────────────────────────────────────
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-function timeAgo(iso) {
-  const diff = Date.now() - new Date(iso).getTime();
-  const m = Math.floor(diff/60000);
-  if (m < 1) return 'just now';
-  if (m < 60) return m + 'm ago';
-  return Math.floor(m/60) + 'h ago';
-}
-
-// ── Message handler ──────────────────────────────────────────
-window.addEventListener('message', e => {
-  const { type, data } = e.data;
-  switch (type) {
-    case 'stats':    updateStats(data); break;
-    case 'devices':  renderDevices(data); break;
-    case 'log':      addLog(data); break;
-    case 'logs':     (data || []).slice(0,30).reverse().forEach(addLog); break;
-    case 'qr':       showQR(data); break;
-    case 'token_expired': expireQR(); break;
-    case 'token_tick':
-      tokenRemaining = data.remaining;
-      updateTimer();
-      break;
-    case 'paired':   pairSuccess(data); break;
+  function stopUptime() {
+    clearInterval(uptimeTimer);
+    uptimeStart = null;
+    document.getElementById('uptime').textContent = '—';
   }
-});
+  function renderUptime() {
+    if (!uptimeStart) { return; }
+    const s   = Math.floor((Date.now() - uptimeStart) / 1000);
+    const h   = Math.floor(s / 3600);
+    const m   = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    document.getElementById('uptime').textContent = h > 0
+      ? h + 'h ' + String(m).padStart(2, '0') + 'm'
+      : String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+  }
 
-// Init
-vscode.postMessage({ type: 'ready' });
+  // ── Full state ──────────────────────────────────────────────
+  function applyState(state) {
+    const { stats, devices, envs, vault } = state;
+
+    // Resolve hasPairedDevice FIRST so all subsequent functions read it correctly
+    hasPairedDevice = !!(devices && devices.length > 0);
+
+    updateStatus(stats);
+    renderDevice(devices);
+    renderEnvs(envs || []);
+    renderVault(vault || []);
+
+    const hasData = (stats.envProjects > 0) || (stats.vaultEntries > 0);
+    document.getElementById('stats-row').style.display = hasData ? '' : 'none';
+    document.getElementById('stat-vars').textContent = stats.totalVars != null ? stats.totalVars : 0;
+    document.getElementById('stat-projects').textContent =
+      (stats.envProjects || 0) + ' project' + (stats.envProjects === 1 ? '' : 's');
+    document.getElementById('stat-vault').textContent = stats.vaultEntries != null ? stats.vaultEntries : 0;
+  }
+
+  // ── Daemon status ────────────────────────────────────────────
+  function updateStatus(stats) {
+    daemonRunning = !!stats.running;
+
+    const dot = document.getElementById('sdot');
+    const lbl = document.getElementById('slbl');
+    const meta = document.getElementById('smeta');
+    const btn = document.getElementById('toggle-btn');
+    const gen = document.getElementById('gen-btn');
+
+    if (daemonRunning) {
+      dot.className    = 'sdot on';
+      lbl.className    = 'slbl on';
+      lbl.textContent  = 'daemon · online';
+      meta.textContent = ':' + stats.port;
+      btn.className    = 'tbtn stop';
+      btn.textContent  = 'Stop';
+      startUptime(stats.uptime || 0);
+    } else {
+      dot.className    = 'sdot';
+      lbl.className    = 'slbl';
+      lbl.textContent  = 'daemon · offline';
+      meta.textContent = '—';
+      btn.className    = 'tbtn start';
+      btn.textContent  = 'Start';
+      stopUptime();
+    }
+
+    gen.disabled = !daemonRunning || hasPairedDevice;
+  }
+
+  // ── Device ──────────────────────────────────────────────────
+  function renderDevice(devices) {
+    const pairSec   = document.getElementById('pair-section');
+    const deviceSec = document.getElementById('device-section');
+    const slot      = document.getElementById('device-slot');
+    const gen       = document.getElementById('gen-btn');
+
+    if (hasPairedDevice) {
+      pairSec.style.display   = 'none';
+      deviceSec.style.display = '';
+      gen.disabled = true;
+
+      const d = devices[devices.length - 1];
+      slot.innerHTML =
+        '<div class="device-card">' +
+          '<div class="dorb"></div>' +
+          '<div class="dinfo">' +
+            '<div class="dname">' + esc(d.name) + '</div>' +
+            '<div class="dmeta">Paired ' + ago(d.pairedAt) + '</div>' +
+          '</div>' +
+          '<div class="dbadge">paired</div>' +
+          '<button class="disc-btn" data-id="' + esc(d.id) + '">Disconnect</button>' +
+        '</div>';
+    } else {
+      pairSec.style.display   = '';
+      deviceSec.style.display = 'none';
+      slot.innerHTML = '';
+      gen.disabled = !daemonRunning;
+    }
+  }
+
+  // ── ENV ─────────────────────────────────────────────────────
+  const PROJ_COLORS = ['#7c6dff','#34d399','#60a5fa','#fbbf24','#f87171','#a78bfa','#fb923c'];
+
+  function renderEnvs(envs) {
+    const sec  = document.getElementById('env-section');
+    const list = document.getElementById('env-list');
+    if (!envs || envs.length === 0) { sec.style.display = 'none'; return; }
+    sec.style.display = '';
+
+    // Group by project
+    const byProject = {};
+    envs.forEach(function(e) {
+      if (!byProject[e.project]) { byProject[e.project] = []; }
+      byProject[e.project].push(e);
+    });
+
+    list.innerHTML = '';
+    var pi = 0;
+    for (var proj in byProject) {
+      var instances = byProject[proj];
+      var color = PROJ_COLORS[pi % PROJ_COLORS.length];
+      var projKey = 'proj-' + pi;
+      var isOpen = openProjects.has(projKey);
+      pi++;
+
+      var tags = instances.map(function(e) {
+        return '<span class="proj-env-tag" style="background:' + color + '18;color:' + color + ';border:1px solid ' + color + '30">' + esc(e.environment) + '</span>';
+      }).join(' ');
+
+      var varRows = instances.flatMap(function(inst) {
+        return inst.vars.map(function(v) {
+          return '<div class="var-row"><span class="var-key">' + esc(v.key) + '</span><span class="var-type">' + esc(v.type) + '</span>' + (v.secret ? '<span class="var-secret">🔒</span>' : '') + '</div>';
+        });
+      }).join('');
+
+      var el = document.createElement('div');
+      el.className = 'env-proj';
+      el.innerHTML =
+        '<div class="env-proj-hd" data-projkey="' + projKey + '">' +
+          '<div class="proj-dot" style="background:' + color + '"></div>' +
+          '<span class="proj-name">' + esc(proj) + '</span>' +
+          tags +
+          '<span class="proj-chev' + (isOpen ? ' open' : '') + '">›</span>' +
+        '</div>' +
+        '<div class="env-vars" id="' + projKey + '" style="' + (isOpen ? '' : 'display:none') + '">' + varRows + '</div>';
+      list.appendChild(el);
+    }
+  }
+
+  // ── Vault ────────────────────────────────────────────────────
+  var FAVICON_MAP = {
+    github:'🐙', google:'🔵', apple:'🍎', twitter:'🐦', facebook:'📘',
+    instagram:'📸', linkedin:'💼', discord:'💬', slack:'💬', aws:'☁️',
+    vercel:'▲', figma:'🎨', notion:'📝', stripe:'💳', paypal:'💸',
+    netflix:'📺', spotify:'🎵',
+  };
+  var CAT_COLORS = {
+    work:'#60a5fa', personal:'#34d399', dev:'#a78bfa',
+    finance:'#fbbf24', social:'#f87171',
+  };
+
+  function getFavicon(service) {
+    var k = (service || '').toLowerCase();
+    for (var kw in FAVICON_MAP) { if (k.indexOf(kw) !== -1) { return FAVICON_MAP[kw]; } }
+    return (service || '?').charAt(0).toUpperCase();
+  }
+
+  function renderVault(vault) {
+    var sec  = document.getElementById('vault-section');
+    var list = document.getElementById('vault-list');
+    if (!vault || vault.length === 0) { sec.style.display = 'none'; return; }
+    sec.style.display = '';
+    list.innerHTML = vault.map(function(e) {
+      var fv = getFavicon(e.service);
+      var cc = CAT_COLORS[e.category] || '#71717a';
+      return '<div class="vault-entry">' +
+        '<div class="vault-fav">' + esc(fv) + '</div>' +
+        '<div class="vault-info"><div class="vault-svc">' + esc(e.service) + '</div><div class="vault-usr">' + esc(e.username || '—') + '</div></div>' +
+        '<div class="vault-cat" style="color:' + cc + ';border:1px solid ' + cc + '25;background:' + cc + '12">' + esc(e.category || 'other') + '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  // ── QR ───────────────────────────────────────────────────────
+  function showQR(data) {
+    document.getElementById('qr-steps').style.display   = 'none';
+    document.getElementById('qr-expired').style.display = 'none';
+    document.getElementById('qr-section').style.display = '';
+    document.getElementById('qr-img').src               = data.dataUrl;
+    document.getElementById('qr-addr').textContent      = 'ws://' + data.host + ':' + data.port;
+    document.getElementById('qr-token').textContent     = data.token;
+    tokenMax = 300; tokenRemaining = 300;
+    updateTimer();
+  }
+  function updateTimer() {
+    var pct = Math.max(0, (tokenRemaining / tokenMax) * 100);
+    document.getElementById('timer-fill').style.width = pct + '%';
+    var m = Math.floor(tokenRemaining / 60);
+    var s = tokenRemaining % 60;
+    document.getElementById('timer-lbl').textContent = 'Expires in ' + m + ':' + String(s).padStart(2, '0');
+  }
+  function expireQR() {
+    document.getElementById('qr-section').style.display = 'none';
+    document.getElementById('qr-steps').style.display   = 'none';
+    document.getElementById('qr-expired').style.display = '';
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function ago(iso) {
+    var diff = Date.now() - new Date(iso).getTime();
+    var m = Math.floor(diff / 60000);
+    if (m < 1) { return 'just now'; }
+    if (m < 60) { return m + 'm ago'; }
+    return Math.floor(m / 60) + 'h ago';
+  }
+
+  // ── Message handler ───────────────────────────────────────────
+  window.addEventListener('message', function(e) {
+    var msg = e.data;
+    switch (msg.type) {
+      case 'state':
+        applyState(msg.data);
+        break;
+      case 'qr':
+        showQR(msg.data);
+        break;
+      case 'token_expired':
+        expireQR();
+        break;
+      case 'token_tick':
+        tokenRemaining = msg.data.remaining;
+        updateTimer();
+        break;
+      case 'paired':
+        document.getElementById('qr-section').style.display = 'none';
+        document.getElementById('qr-steps').style.display   = '';
+        break;
+    }
+  });
+
+  // Tell the extension we're ready
+  vscode.postMessage({ type: 'ready' });
+
+})();
 </script>
 </body>
 </html>`;

@@ -12,7 +12,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const cfg   = loadConfig(context);
   const store = loadStore(context);
-  const port  = vscode.workspace.getConfiguration('orb').get<number>('port', 3131);
+  const port  = vscode.workspace.getConfiguration('orb').get<number>('port', 3132);
 
   // Create daemon instance
   daemon = new OrbDaemon(context, cfg, store, port);

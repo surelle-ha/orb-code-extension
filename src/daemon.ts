@@ -289,4 +289,29 @@ export class OrbDaemon {
       blocklistActive: this.store.blocklist.filter(p => p.enabled).length,
     };
   }
+
+  /** Return a snapshot of all synced data for the sidebar to display. */
+  getData() {
+    // Build env list: [{project, environment, count, vars:[{key,type,secret}]}]
+    const envs: Array<{ project: string; environment: string; count: number; vars: Array<{ key: string; type: string; secret: boolean }> }> = [];
+    for (const [project, envMap] of Object.entries(this.store.envs)) {
+      for (const [environment, vars] of Object.entries(envMap)) {
+        envs.push({
+          project,
+          environment,
+          count: vars.length,
+          vars: vars.map(v => ({ key: v.key, type: v.type, secret: v.secret })),
+        });
+      }
+    }
+    // Vault: strip encrypted_password for display
+    const vault = this.store.vault.map(e => ({
+      id: e.id,
+      service: e.service,
+      username: e.username,
+      category: e.category,
+      url: e.url,
+    }));
+    return { envs, vault };
+  }
 }

@@ -4,7 +4,7 @@ A TypeScript-native VS Code extension that replaces the Rust daemon. Runs a WebS
 
 ## Features
 
-- **WebSocket daemon** on port 3131 (configurable), starts automatically with VS Code
+- **WebSocket daemon** on port 3132 (configurable), starts automatically with VS Code
 - **QR code pairing** with 5-minute token expiry — pairs with the Orb mobile app
 - **ENV sync** — receives `.env` vars from the mobile app and writes them as `~/.orb-devkit/envs/<project>/<env>.env`
 - **Vault backup** — receives encrypted vault entries
@@ -36,7 +36,7 @@ npm run package
 The extension speaks the same JSON-over-WebSocket protocol as the original Rust daemon:
 
 \`\`\`
-ws://0.0.0.0:3131
+ws://0.0.0.0:3132
 \`\`\`
 
 All messages are plain JSON (no binary framing needed — the mobile app sends text frames when connecting to this endpoint):
@@ -68,7 +68,7 @@ All messages are plain JSON (no binary framing needed — the mobile app sends t
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `orb.port` | `3131` | WebSocket port |
+| `orb.port` | `3132` | WebSocket port |
 | `orb.autoStart` | `true` | Start daemon when VS Code opens |
 
 ## Data Storage

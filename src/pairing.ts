@@ -23,7 +23,11 @@ export function consumePairingToken(cfg: OrbConfig, token: string): boolean {
 }
 
 export function addPairedDevice(cfg: OrbConfig, device: PairedDevice): void {
-  cfg.pairedDevices = cfg.pairedDevices.filter(d => d.id !== device.id);
+  // Deduplicate by name AND os so the same physical device re-pairing
+  // just updates the existing entry rather than appending a duplicate.
+  cfg.pairedDevices = cfg.pairedDevices.filter(
+    d => d.id !== device.id && !(d.name === device.name && d.os === device.os),
+  );
   cfg.pairedDevices.push(device);
 }
 

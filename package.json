@@ -60,7 +60,7 @@
       "properties": {
         "orb.port": {
           "type": "number",
-          "default": 3131,
+          "default": 3132,
           "description": "WebSocket port for the Orb daemon"
         },
         "orb.autoStart": {
